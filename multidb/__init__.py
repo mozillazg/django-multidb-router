@@ -29,30 +29,57 @@ If you want to get a connection to a slave in your app, use
 """
 import itertools
 import random
-
+import datetime
 from django.conf import settings
+
 
 from .pinning import this_thread_is_pinned, db_write
 
+import logging
+logger = logging.getLogger(__name__)
+
+UNIMAGINEABLE_FUTURE = datetime.datetime.now() + datetime.timedelta(days=365*1000)
 
 DEFAULT_DB_ALIAS = 'default'
+RECONNECT_TIME = datetime.timedelta(seconds=60 * getattr(settings, 'RECONNECT_TIME', 60))
 
 
-if getattr(settings, 'SLAVE_DATABASES'):
-    # Shuffle the list so the first slave db isn't slammed during startup.
-    dbs = list(settings.SLAVE_DATABASES)
-    random.shuffle(dbs)
-    slaves = itertools.cycle(dbs)
-    # Set the slaves as test mirrors of the master.
-    for db in dbs:
-        settings.DATABASES[db]['TEST_MIRROR'] = DEFAULT_DB_ALIAS
-else:
-    slaves = itertools.repeat(DEFAULT_DB_ALIAS)
 
-
-def get_slave():
-    """Returns the alias of a slave database."""
-    return slaves.next()
+for db in getattr(settings, 'SLAVE_DATABASES'):
+    settings.DATABASES[db]['TEST_MIRROR'] = DEFAULT_DB_ALIAS
+    
+    
+class SlavesProcessor:
+    slaves_statistics = dict((db, {'available': True}) for db in getattr(settings, 'SLAVE_DATABASES'))  
+    
+    @classmethod
+    def reset_slave_databases(cls):
+        if getattr(settings, 'SLAVE_DATABASES'):
+            dbs = filter(lambda x: cls.slaves_statistics[x]['available'], cls.slaves_statistics.keys())
+            if dbs:                
+                cls.slaves = itertools.cycle(dbs)
+                return            
+        cls.slaves = itertools.repeat(DEFAULT_DB_ALIAS)
+            
+    @classmethod
+    def get_slave(cls):
+        """Returns the alias of a slave database."""
+        from django.db import connections
+        next = cls.slaves.next()
+        try:
+            connections[next].cursor()
+        except Exception as e:
+            cls.disable_connection(next)
+            return DEFAULT_DB_ALIAS
+        else:
+            return next
+        
+    @classmethod
+    def disable_connection(cls, alias):
+        cls.slaves_statistics[alias]['available'] = False
+        cls.reset_slave_databases()
+    
+SlavesProcessor.reset_slave_databases()
 
 
 class MasterSlaveRouter(object):
@@ -60,7 +87,7 @@ class MasterSlaveRouter(object):
 
     def db_for_read(self, model, **hints):
         """Send reads to slaves in round-robin."""
-        return get_slave()
+        return SlavesProcessor.get_slave()
 
     def db_for_write(self, model, **hints):
         """Send all writes to the master."""
@@ -87,4 +114,4 @@ class PinningMasterSlaveRouter(MasterSlaveRouter):
     def db_for_read(self, model, **hints):
         """Send reads to slaves in round-robin unless this thread is "stuck" to
         the master."""
-        return DEFAULT_DB_ALIAS if this_thread_is_pinned() else get_slave()
+        return DEFAULT_DB_ALIAS if this_thread_is_pinned() else SlavesProcessor.get_slave()
