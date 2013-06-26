@@ -87,6 +87,8 @@ class MasterSlaveRouter(object):
 
     def db_for_read(self, model, **hints):
         """Send reads to slaves in round-robin."""
+        if model._meta.app_label == 'auth':
+            return DEFAULT_DB_ALIAS
         return SlavesProcessor.get_slave()
 
     def db_for_write(self, model, **hints):
@@ -114,4 +116,6 @@ class PinningMasterSlaveRouter(MasterSlaveRouter):
     def db_for_read(self, model, **hints):
         """Send reads to slaves in round-robin unless this thread is "stuck" to
         the master."""
+        if model._meta.app_label == 'auth':
+            return DEFAULT_DB_ALIAS
         return DEFAULT_DB_ALIAS if this_thread_is_pinned() else SlavesProcessor.get_slave()
